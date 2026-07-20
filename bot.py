@@ -19,7 +19,7 @@ TG_CHAT_ID = "1950462171"
 SYMBOL          = "SOLUSDT"
 TIMEFRAME_MINS  = 2           # Synthesized timeframe block (e.g. 2 minutes)
 ATR_PERIOD      = 14          
-SEED_CANDLES    = 200         # Will fetch 200 × 2 = 400 1m candles for seeding
+SEED_CANDLES    = 200         # Fetch 200 × 2 = 400 1m candles for seeding
 ATR_MULTIPLIER  = 1.0         
 SL_ATR_MULT     = 1.5         
 TP_SL_MULT      = 3.0         
@@ -380,11 +380,10 @@ class RenkoBot:
             self._prev_brick_dir = bdir
 
     async def _ws_listen(self) -> None:
-        # We always connect to the 1m stream to build our synthetic timeframes
         stream = f"{SYMBOL.lower()}@kline_1m"
-        url = f"{BINANCE_WS_URL}?streams={stream}"
+        url = f"{BINANCE_WS_URL}/{stream}"
         
-        log.info(f"Connecting to Binance WS: {stream}")
+        log.info(f"Connecting to Binance WS: {url}")
         
         async with self.session.ws_connect(url) as ws:
             log.info("WebSocket connected. Bot is live.")
@@ -392,14 +391,13 @@ class RenkoBot:
             startup_msg = (f"🤖 <b>Bot Started</b> 🤖\n"
                            f"Pair: {SYMBOL}\n"
                            f"Timeframe: <code>Synthetic {TIMEFRAME_MINS}m</code>\n"
-                           f"Box (ATR-14): <code>{self.renko.box_size:.4f} USDT</code>\n"
-                           f"Price: <code>{self.renko.current_price:.4f}</code>")
+                           f"Box (ATR-14): <code>{self.renko.box_size:.4f} USDT</code>")
             await tg_send(self.session, startup_msg)
 
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
-                    await self._handle_ws_msg(data.get("data", {}))
+                    await self._handle_ws_msg(data)
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     log.warning("WebSocket disconnected.")
                     break
