@@ -1,553 +1,480 @@
-"""SOL/USDT Renko Forward-Testing Bot
-====================================
-Exchange  : Binance (public REST + WebSocket — no API key needed for data)
-Timeframe : 2-minute candles (resampled from 1-minute)
-Box Size  : ATR-14 (recalculated every new completed candle)
-Buy Signal: First GREEN brick after a trend reversal (red → green)
-Stop-Loss : 1.5 × ATR below entry
-Take-Profit: 3 × SL distance above entry  (i.e. 4.5 × ATR)
-Alerts    : Telegram
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║     SOLUSDT 5m — 9 EMA / 9 SMA Crossover Backtester             ║
+║     Entry  : BUY when 9-EMA crosses ABOVE its 9-SMA             ║
+║     SL     : 1.5× ATR below entry                               ║
+║     TP     : 5× SL distance above entry                         ║
+║     Fee    : 0.08% round-trip (Binance)                         ║
+║     Account: $1 000 with compounding                            ║
+╚══════════════════════════════════════════════════════════════════╝
+
+All parameters are customisable at the top of the CONFIG section.
+Run:  python solusdt_ema_sma_backtest.py
 """
 
-import asyncio
-import json
-import logging
+import sys
+import time
 import math
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
 
-import aiohttp
+# ─────────────────────────────────────────────────────────────────
+#  CONFIG  ── change anything here
+# ─────────────────────────────────────────────────────────────────
+SYMBOL          = "SOLUSDT"          # Binance symbol
+INTERVAL        = "5m"               # Kline interval
+LOOKBACK_DAYS   = 365                # How many days of history to fetch
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG  — edit only this section
-# ─────────────────────────────────────────────────────────────────────────────
-TG_TOKEN   = "8392707199:AAHjWHGLoZ3Udm4rS5JlgSaPLez1qZbHMOo"
-TG_CHAT_ID = "1950462171"
+EMA_LEN         = 9                  # Fast EMA length
+SMA_LEN         = 9                  # Smoothing SMA length (applied to the EMA)
 
-SYMBOL           = "SOLUSDT"
-ATR_PERIOD       = 14
-SEED_CANDLES     = 400        # 400 × 1m = 200 × 2m candles for warm-up
-ATR_MULTIPLIER   = 1.0
-SL_ATR_MULT      = 1.5
-TP_SL_MULT       = 3.0
-RESAMPLE_MINUTES = 2          # resample 1m → 2m
+ATR_LEN         = 14                 # ATR period for SL sizing
+SL_ATR_MULT     = 1.5                # SL = entry − (SL_ATR_MULT × ATR)
+TP_SL_MULT      = 5.0                # TP = entry + (TP_SL_MULT × SL_distance)
 
-BINANCE_REST_URL = "https://api.binance.com"
-BINANCE_WS_URL   = "wss://stream.binance.com:9443/ws"
-# ─────────────────────────────────────────────────────────────────────────────
+INITIAL_CAPITAL = 1_000.0            # Starting account size in USD
+FEE_RT_PCT      = 0.08               # Round-trip fee in percent (0.08 = 0.08 %)
+RISK_PCT        = 1.0                # % of current equity risked per trade (for position sizing)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("renko_bot")
+# ─────────────────────────────────────────────────────────────────
+#  BINANCE DATA FETCH
+# ─────────────────────────────────────────────────────────────────
+BINANCE_SPOT_URL    = "https://api.binance.com/api/v3/klines"
+BINANCE_FUTURES_URL = "https://fapi.binance.com/fapi/v1/klines"
+MAX_KLINES_PER_REQ  = 1_000          # Binance limit per request
 
+def fetch_klines(symbol: str, interval: str, days: int) -> pd.DataFrame:
+    """Fetch OHLCV klines from Binance (spot, with futures fallback)."""
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1_000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1_000)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════════════════════════════════════
-async def tg_send(session: aiohttp.ClientSession, text: str) -> None:
-    url     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    for attempt in range(2):
-        try:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    return
-                body = await r.text()
-                log.warning("TG HTTP %s: %s", r.status, body)
-        except Exception as exc:
-            log.warning("TG send error (attempt %d): %s", attempt + 1, exc)
-        await asyncio.sleep(1)
+    all_rows = []
+    current_start = start_ms
+    url = BINANCE_SPOT_URL
 
+    print(f"\n📡  Fetching {symbol} {interval} from Binance …")
+    req_count = 0
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2-MINUTE RESAMPLER
-# ══════════════════════════════════════════════════════════════════════════════
-class CandleResampler:
-    """
-    Accumulates 1-min closed candles and emits a completed N-min candle
-    every RESAMPLE_MINUTES bars based on timestamp bucketing.
-    """
-
-    def __init__(self, minutes: int = RESAMPLE_MINUTES):
-        self.minutes = minutes
-        self._bucket: Optional[int]   = None
-        self._open:   Optional[float] = None
-        self._high:   Optional[float] = None
-        self._low:    Optional[float] = None
-        self._close:  Optional[float] = None
-        self._ts:     Optional[datetime] = None
-        self._count:  int = 0
-
-    def _bucket_id(self, ts: datetime) -> int:
-        epoch_min = int(ts.timestamp()) // 60
-        return epoch_min // self.minutes
-
-    def feed(self, candle: dict) -> Optional[dict]:
-        """
-        Feed one closed 1-min candle.
-        Returns a completed N-min candle dict, or None if not yet complete.
-        """
-        bucket = self._bucket_id(candle["ts"])
-
-        if self._bucket is None or bucket != self._bucket:
-            self._bucket = bucket
-            self._open   = candle["open"]
-            self._high   = candle["high"]
-            self._low    = candle["low"]
-            self._close  = candle["close"]
-            self._ts     = candle["ts"]
-            self._count  = 1
-        else:
-            self._high  = max(self._high,  candle["high"])
-            self._low   = min(self._low,   candle["low"])
-            self._close = candle["close"]
-            self._count += 1
-
-        if self._count >= self.minutes:
-            result = {
-                "open":  self._open,
-                "high":  self._high,
-                "low":   self._low,
-                "close": self._close,
-                "ts":    self._ts,
-            }
-            self._bucket = None
-            self._count  = 0
-            return result
-
-        return None
-
-
-def resample_candles(candles_1m: list, minutes: int = RESAMPLE_MINUTES) -> list:
-    """Batch-resample a list of 1-min candles into N-min candles."""
-    resampler = CandleResampler(minutes)
-    result    = []
-    for c in candles_1m:
-        out = resampler.feed(c)
-        if out:
-            result.append(out)
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ATR CALCULATOR  (Wilder / RMA smoothing)
-# ══════════════════════════════════════════════════════════════════════════════
-class ATR:
-    def __init__(self, period: int = 14):
-        self.period       = period
-        self._prev_close: Optional[float] = None
-        self._rma:        Optional[float] = None
-        self._count       = 0
-        self._warm        = False
-        self._sum_tr      = 0.0
-
-    @property
-    def value(self) -> Optional[float]:
-        return self._rma if self._warm else None
-
-    def update(self, high: float, low: float, close: float) -> Optional[float]:
-        if self._prev_close is None:
-            tr = high - low
-        else:
-            tr = max(high - low,
-                     abs(high - self._prev_close),
-                     abs(low  - self._prev_close))
-
-        self._prev_close = close
-        self._count += 1
-
-        if not self._warm:
-            self._sum_tr += tr
-            if self._count >= self.period:
-                self._rma  = self._sum_tr / self.period
-                self._warm = True
-        else:
-            alpha     = 1.0 / self.period
-            self._rma = self._rma * (1 - alpha) + tr * alpha
-
-        return self._rma if self._warm else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RENKO ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class RenkoBrick:
-    direction:   int
-    open_price:  float
-    close_price: float
-    formed_at:   datetime
-
-
-@dataclass
-class RenkoState:
-    bricks:       list  = field(default_factory=list)
-    last_close:   Optional[float]    = None
-    current_dir:  Optional[int]      = None
-    box_size:     Optional[float]    = None
-    pending_open: Optional[float]    = None
-
-    def set_box(self, box: float) -> None:
-        self.box_size = round(box, 4)
-
-    def _snap(self, price: float, box: float) -> float:
-        return math.floor(price / box) * box
-
-    def seed_price(self, price: float) -> None:
-        if self.last_close is None and self.box_size:
-            self.last_close   = self._snap(price, self.box_size)
-            self.pending_open = self.last_close
-
-    def feed(self, price: float, ts: datetime) -> list:
-        if self.box_size is None or self.last_close is None:
-            return []
-
-        box    = self.box_size
-        new_bx = []
-
-        while True:
-            up_target   = self.last_close + box
-            down_target = self.last_close - box
-
-            if price >= up_target:
-                open_p = self.last_close
-                brick  = RenkoBrick(+1, open_p, open_p + box, ts)
-                new_bx.append(brick)
-                self.bricks.append(brick)
-                self.last_close  = open_p + box
-                self.current_dir = +1
-
-            elif price <= down_target:
-                open_p = self.last_close
-                brick  = RenkoBrick(-1, open_p, open_p - box, ts)
-                new_bx.append(brick)
-                self.bricks.append(brick)
-                self.last_close  = open_p - box
-                self.current_dir = -1
-            else:
-                break
-
-        return new_bx
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TRADE TRACKER
-# ══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class Trade:
-    entry_price:  float
-    sl:           float
-    tp:           float
-    atr_at_entry: float
-    entered_at:   datetime
-    status:       str = "OPEN"
-    exit_price:   Optional[float]    = None
-    exited_at:    Optional[datetime] = None
-
-    @property
-    def pnl_pct(self) -> Optional[float]:
-        if self.exit_price is None:
-            return None
-        return (self.exit_price - self.entry_price) / self.entry_price * 100
-
-
-class TradeManager:
-    def __init__(self):
-        self.open_trade: Optional[Trade] = None
-        self.history:    list[Trade]     = []
-
-    def has_open(self) -> bool:
-        return self.open_trade is not None
-
-    def open(self, price: float, sl: float, tp: float, atr: float, ts: datetime) -> Trade:
-        t = Trade(price, sl, tp, atr, ts)
-        self.open_trade = t
-        return t
-
-    def check(self, price: float, ts: datetime) -> Optional[Trade]:
-        t = self.open_trade
-        if t is None:
-            return None
-        if price <= t.sl:
-            t.status     = "HIT_SL"
-            t.exit_price = t.sl
-            t.exited_at  = ts
-            self.history.append(t)
-            self.open_trade = None
-            return t
-        if price >= t.tp:
-            t.status     = "HIT_TP"
-            t.exit_price = t.tp
-            t.exited_at  = ts
-            self.history.append(t)
-            self.open_trade = None
-            return t
-        return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BINANCE HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-async def fetch_klines(session: aiohttp.ClientSession, limit: int = 400) -> list:
-    """Fetch recent 1-min klines from Binance REST."""
-    url    = f"{BINANCE_REST_URL}/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": "1m", "limit": limit}
-    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
-        r.raise_for_status()
-        raw = await r.json()
-    candles = []
-    for k in raw:
-        candles.append({
-            "open":  float(k[1]),
-            "high":  float(k[2]),
-            "low":   float(k[3]),
-            "close": float(k[4]),
-            "ts":    datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
-        })
-    return candles
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN BOT
-# ══════════════════════════════════════════════════════════════════════════════
-class RenkoBot:
-    def __init__(self):
-        self.atr       = ATR(ATR_PERIOD)
-        self.renko     = RenkoState()
-        self.trades    = TradeManager()
-        self.resampler = CandleResampler(RESAMPLE_MINUTES)
-        self.session:          Optional[aiohttp.ClientSession] = None
-        self._last_candle_ts:  Optional[int] = None
-        self._prev_brick_dir:  Optional[int] = None
-
-    # ── seeding ───────────────────────────────────────────────────────────────
-    async def seed(self) -> None:
-        log.info("Fetching %d × 1-min seed candles for %s …", SEED_CANDLES, SYMBOL)
-        candles_1m = await fetch_klines(self.session, limit=SEED_CANDLES)
-
-        # Exclude the still-open last 1m candle before resampling
-        candles_2m = resample_candles(candles_1m[:-1])
-        log.info("Resampled into %d × %d-min candles", len(candles_2m), RESAMPLE_MINUTES)
-
-        for c in candles_2m:
-            atr_val = self.atr.update(c["high"], c["low"], c["close"])
-            if atr_val and self.renko.box_size is None:
-                self.renko.set_box(atr_val * ATR_MULTIPLIER)
-                self.renko.seed_price(c["close"])
-                log.info("Box size initialised: %.4f USDT  (ATR=%.4f)",
-                         self.renko.box_size, atr_val)
-
-            if self.renko.box_size:
-                self.renko.feed(c["close"], c["ts"])
-
-        self._last_candle_ts = int(candles_1m[-1]["ts"].timestamp() * 1000)
-        log.info("Seed complete. Renko bricks built: %d", len(self.renko.bricks))
-        if self.renko.bricks:
-            last = self.renko.bricks[-1]
-            log.info("Last brick: %s @ %.4f → %.4f",
-                     "GREEN" if last.direction == 1 else "RED",
-                     last.open_price, last.close_price)
-
-    # ── WebSocket listener ────────────────────────────────────────────────────
-    async def _ws_listen(self) -> None:
-        stream = f"{SYMBOL.lower()}@kline_1m"
-        url    = f"{BINANCE_WS_URL}/{stream}"
-        log.info("Connecting to Binance WebSocket: %s", url)
-
-        while True:
-            try:
-                async with self.session.ws_connect(
-                    url,
-                    heartbeat=20,
-                    receive_timeout=90,
-                ) as ws:
-                    await tg_send(
-                        self.session,
-                        f"🤖 <b>Renko Bot LIVE</b>\n"
-                        f"Symbol    : <code>{SYMBOL}</code>\n"
-                        f"Timeframe : <code>{RESAMPLE_MINUTES}-min (resampled from 1m)</code>\n"
-                        f"Box (ATR-14): <code>{self.renko.box_size:.4f} USDT</code>\n"
-                        f"Signal    : 1st green brick after red→green reversal\n"
-                        f"SL: 1.5×ATR | TP: 3×SL distance\n"
-                        f"Started   : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                    )
-                    log.info("WebSocket connected ✓")
-
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            await self._handle_ws_msg(json.loads(msg.data))
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            log.warning("WS closed/error — reconnecting …")
-                            break
-
-            except Exception as exc:
-                log.error("WS error: %s — reconnecting in 5 s …", exc)
-                await asyncio.sleep(5)
-
-    # ── Handle each incoming 1-min WS message ────────────────────────────────
-    async def _handle_ws_msg(self, data: dict) -> None:
-        k         = data.get("k", {})
-        is_closed = k.get("x", False)
-
-        price = float(k["c"])
-        ts_ms = int(k["t"])
-        ts    = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-
-        # Always check open trade on every tick
-        if self.trades.has_open():
-            closed = self.trades.check(price, ts)
-            if closed:
-                await self._on_trade_closed(closed)
-
-        # Only process fully closed 1-min candles for resampling
-        if not is_closed:
-            return
-        if ts_ms == self._last_candle_ts:
-            return   # duplicate guard
-        self._last_candle_ts = ts_ms
-
-        candle_1m = {
-            "open":  float(k["o"]),
-            "high":  float(k["h"]),
-            "low":   float(k["l"]),
-            "close": float(k["c"]),
-            "ts":    ts,
+    while current_start < end_ms:
+        params = {
+            "symbol":    symbol,
+            "interval":  interval,
+            "startTime": current_start,
+            "endTime":   end_ms,
+            "limit":     MAX_KLINES_PER_REQ,
         }
+        try:
+            resp = requests.get(url, params=params, timeout=20)
+        except Exception as e:
+            sys.exit(f"❌  Network error: {e}")
 
-        # Feed into resampler — only proceed if a 2-min candle is complete
-        candle_2m = self.resampler.feed(candle_1m)
-        if candle_2m is None:
-            return   # 2-min candle not yet complete
+        if resp.status_code == 451:
+            # geo-blocked on spot → try futures
+            url = BINANCE_FUTURES_URL
+            continue
+        if resp.status_code != 200:
+            sys.exit(f"❌  Binance returned HTTP {resp.status_code}: {resp.text[:200]}")
 
-        high  = candle_2m["high"]
-        low   = candle_2m["low"]
-        close = candle_2m["close"]
-        ts_2m = candle_2m["ts"]
+        batch = resp.json()
+        if not batch:
+            break
 
-        log.info("2m candle closed  O=%.4f H=%.4f L=%.4f C=%.4f  @ %s UTC",
-                 candle_2m["open"], high, low, close,
-                 ts_2m.strftime("%H:%M:%S"))
+        all_rows.extend(batch)
+        last_open_ms = batch[-1][0]
+        if last_open_ms == current_start:
+            break
+        current_start = last_open_ms + 1
+        req_count += 1
 
-        # Update ATR with the completed 2-min candle
-        atr_val = self.atr.update(high, low, close)
-        if atr_val is None:
-            return   # still warming up
+        # polite rate-limiting
+        if req_count % 5 == 0:
+            time.sleep(0.5)
 
-        # Adaptive box update (only if change > 5%)
-        new_box = round(atr_val * ATR_MULTIPLIER, 4)
-        if self.renko.box_size is None:
-            self.renko.set_box(new_box)
-            self.renko.seed_price(close)
+    if not all_rows:
+        sys.exit("❌  No kline data returned — check symbol / interval.")
+
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_vol","trades","taker_buy_base",
+        "taker_buy_quote","ignore"
+    ])
+    df = df[["open_time","open","high","low","close","volume"]].copy()
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df.drop_duplicates("open_time", inplace=True)
+    df.sort_values("open_time", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    print(f"✅  {len(df):,} candles loaded  "
+          f"({df['open_time'].iloc[0].strftime('%Y-%m-%d')} → "
+          f"{df['open_time'].iloc[-1].strftime('%Y-%m-%d')})")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────
+#  INDICATORS
+# ─────────────────────────────────────────────────────────────────
+def compute_indicators(df: pd.DataFrame,
+                       ema_len: int, sma_len: int, atr_len: int) -> pd.DataFrame:
+    df = df.copy()
+
+    # 9 EMA on close
+    df["ema"] = df["close"].ewm(span=ema_len, adjust=False).mean()
+
+    # 9 SMA of the EMA (smoothing layer)
+    df["sma_of_ema"] = df["ema"].rolling(sma_len).mean()
+
+    # ATR (Wilder's method = RMA of True Range)
+    high_low   = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close  = (df["low"]  - df["close"].shift()).abs()
+    tr         = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"]  = tr.ewm(alpha=1 / atr_len, adjust=False).mean()
+
+    # Crossover signals: EMA crosses ABOVE SMA-of-EMA
+    ema_above_prev = df["ema"].shift(1) <= df["sma_of_ema"].shift(1)
+    ema_above_now  = df["ema"] > df["sma_of_ema"]
+    df["signal"]   = ema_above_prev & ema_above_now   # True on cross bar
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────
+#  BACKTEST ENGINE
+# ─────────────────────────────────────────────────────────────────
+def run_backtest(df: pd.DataFrame,
+                 initial_capital: float,
+                 sl_atr_mult: float,
+                 tp_sl_mult:  float,
+                 fee_rt_pct:  float,
+                 risk_pct:    float) -> dict:
+
+    equity       = initial_capital
+    peak_equity  = initial_capital
+    max_drawdown = 0.0          # as a positive fraction, e.g. 0.15 = 15 %
+    fee_rt       = fee_rt_pct / 100.0
+
+    trades       = []           # list of completed trade dicts
+    in_trade     = False
+    entry_price  = 0.0
+    sl_price     = 0.0
+    tp_price     = 0.0
+    qty          = 0.0          # in SOL units
+    trade_risk   = 0.0          # USD at risk (before fee)
+    entry_time   = None
+
+    equity_curve = [initial_capital]
+
+    for i in range(1, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        if in_trade:
+            # Check SL / TP using this candle's high & low
+            hit_sl = row["low"]  <= sl_price
+            hit_tp = row["high"] >= tp_price
+
+            if hit_sl or hit_tp:
+                # Conservative: if both hit on same candle, SL wins
+                if hit_sl:
+                    exit_price = sl_price
+                    outcome    = "LOSS"
+                    pnl_pts    = exit_price - entry_price          # negative
+                else:
+                    exit_price = tp_price
+                    outcome    = "WIN"
+                    pnl_pts    = exit_price - entry_price          # positive
+
+                gross_pnl = pnl_pts * qty
+                fee_cost  = entry_price * qty * fee_rt             # round-trip fee
+                net_pnl   = gross_pnl - fee_cost
+                equity   += net_pnl
+
+                trades.append({
+                    "entry_time":  entry_time,
+                    "exit_time":   row["open_time"],
+                    "entry_price": entry_price,
+                    "exit_price":  exit_price,
+                    "sl":          sl_price,
+                    "tp":          tp_price,
+                    "qty":         qty,
+                    "gross_pnl":   gross_pnl,
+                    "fee":         fee_cost,
+                    "net_pnl":     net_pnl,
+                    "outcome":     outcome,
+                    "equity":      equity,
+                })
+
+                # Update drawdown
+                if equity > peak_equity:
+                    peak_equity = equity
+                dd = (peak_equity - equity) / peak_equity
+                if dd > max_drawdown:
+                    max_drawdown = dd
+
+                in_trade = False
+                equity_curve.append(equity)
+
+        # New signal — only enter if NOT already in a trade
+        if not in_trade and prev["signal"]:
+            atr_val = prev["atr"]
+            if math.isnan(atr_val) or atr_val <= 0:
+                continue
+
+            entry_price = row["open"]               # enter on next bar open
+            sl_distance = sl_atr_mult * atr_val
+            sl_price    = entry_price - sl_distance
+            tp_price    = entry_price + tp_sl_mult * sl_distance
+
+            # Position sizing: risk_pct % of current equity
+            risk_usd  = equity * (risk_pct / 100.0)
+            # qty such that (entry − sl) × qty = risk_usd
+            qty       = risk_usd / sl_distance
+            # Deduct entry fee immediately
+            entry_fee = entry_price * qty * (fee_rt / 2)   # half of round-trip on entry
+            equity   -= entry_fee
+
+            in_trade   = True
+            entry_time = row["open_time"]
+            trade_risk = risk_usd
+
+    # If still in trade at end, close at last close price
+    if in_trade:
+        last = df.iloc[-1]
+        exit_price = last["close"]
+        gross_pnl  = (exit_price - entry_price) * qty
+        fee_cost   = entry_price * qty * fee_rt
+        net_pnl    = gross_pnl - fee_cost
+        equity    += net_pnl
+        trades.append({
+            "entry_time":  entry_time,
+            "exit_time":   last["open_time"],
+            "entry_price": entry_price,
+            "exit_price":  exit_price,
+            "sl":          sl_price,
+            "tp":          tp_price,
+            "qty":         qty,
+            "gross_pnl":   gross_pnl,
+            "fee":         fee_cost,
+            "net_pnl":     net_pnl,
+            "outcome":     "OPEN→CLOSED",
+            "equity":      equity,
+        })
+        equity_curve.append(equity)
+
+    return {
+        "trades":       trades,
+        "equity_curve": equity_curve,
+        "final_equity": equity,
+        "max_drawdown": max_drawdown,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  STATISTICS
+# ─────────────────────────────────────────────────────────────────
+def compute_stats(result: dict, initial_capital: float) -> dict:
+    trades  = result["trades"]
+    n       = len(trades)
+    if n == 0:
+        return {"total_trades": 0}
+
+    wins    = [t for t in trades if t["outcome"] == "WIN"]
+    losses  = [t for t in trades if t["outcome"] == "LOSS"]
+
+    n_win   = len(wins)
+    n_loss  = len(losses)
+    win_rt  = n_win / n if n else 0.0
+
+    avg_win  = np.mean([t["net_pnl"] for t in wins])   if wins   else 0.0
+    avg_loss = np.mean([t["net_pnl"] for t in losses]) if losses else 0.0
+
+    # Expected Value per trade (in USD)
+    ev = win_rt * avg_win + (1 - win_rt) * avg_loss
+
+    total_fees = sum(t["fee"] for t in trades)
+    net_profit = result["final_equity"] - initial_capital
+    roi_pct    = net_profit / initial_capital * 100.0
+
+    # Max Drawdown
+    mdd_pct    = result["max_drawdown"] * 100.0
+
+    # Profit Factor
+    gross_wins  = sum(t["net_pnl"] for t in wins)
+    gross_losses = abs(sum(t["net_pnl"] for t in losses))
+    pf = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+    # Consecutive stats
+    outcomes = [1 if t["outcome"] == "WIN" else 0 for t in trades]
+    max_cons_win = max_cons_loss = cur = 0
+    cur_type = None
+    for o in outcomes:
+        if o == cur_type:
+            cur += 1
         else:
-            if abs(new_box - self.renko.box_size) / self.renko.box_size > 0.05:
-                log.info("Box updated: %.4f → %.4f", self.renko.box_size, new_box)
-                self.renko.set_box(new_box)
+            cur_type = o
+            cur = 1
+        if o == 1:
+            max_cons_win  = max(max_cons_win,  cur)
+        else:
+            max_cons_loss = max(max_cons_loss, cur)
 
-        # Save direction BEFORE feeding new price
-        dir_before = self.renko.current_dir
-
-        # Feed close of 2-min candle into Renko
-        new_bricks = self.renko.feed(close, ts_2m)
-
-        for brick in new_bricks:
-            log.info(
-                "%s brick @ %.4f→%.4f  |  ATR=%.4f  |  Box=%.4f  |  %s UTC",
-                "🟢 GREEN" if brick.direction == 1 else "🔴 RED",
-                brick.open_price, brick.close_price,
-                atr_val, self.renko.box_size,
-                ts_2m.strftime("%H:%M:%S"),
-            )
-
-            # Signal: first green brick after red→green reversal
-            if (
-                brick.direction == +1
-                and dir_before   == -1
-                and not self.trades.has_open()
-            ):
-                await self._on_buy_signal(brick, atr_val, ts_2m)
-
-            dir_before = brick.direction
-
-    # ── Trade entry ───────────────────────────────────────────────────────────
-    async def _on_buy_signal(self, brick: RenkoBrick, atr: float, ts: datetime) -> None:
-        entry   = brick.close_price
-        sl      = round(entry - SL_ATR_MULT * atr, 4)
-        sl_dist = entry - sl
-        tp      = round(entry + TP_SL_MULT * sl_dist, 4)
-
-        self.trades.open(entry, sl, tp, atr, ts)
-        log.info("BUY SIGNAL  entry=%.4f  SL=%.4f  TP=%.4f  ATR=%.4f",
-                 entry, sl, tp, atr)
-
-        msg = (
-            f"🟢 <b>BUY SIGNAL — {SYMBOL}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📌 Entry  : <code>{entry:.4f} USDT</code>\n"
-            f"🛑 SL     : <code>{sl:.4f} USDT</code>  (−{SL_ATR_MULT}×ATR)\n"
-            f"🎯 TP     : <code>{tp:.4f} USDT</code>  (+{TP_SL_MULT}×SL dist)\n"
-            f"📊 ATR-14 : <code>{atr:.4f} USDT</code>\n"
-            f"📦 Box    : <code>{self.renko.box_size:.4f} USDT</code>\n"
-            f"🕐 Time   : <code>{ts.strftime('%Y-%m-%d %H:%M:%S UTC')}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Signal: Trend reversal — first green brick after red run</i>"
-        )
-        await tg_send(self.session, msg)
-
-    # ── Trade exit ────────────────────────────────────────────────────────────
-    async def _on_trade_closed(self, trade: Trade) -> None:
-        emoji  = "✅" if trade.status == "HIT_TP" else "❌"
-        result = "TAKE PROFIT" if trade.status == "HIT_TP" else "STOP LOSS"
-        pnl    = trade.pnl_pct
-
-        log.info("TRADE CLOSED  %s  entry=%.4f  exit=%.4f  PnL=%.2f%%",
-                 trade.status, trade.entry_price, trade.exit_price, pnl)
-
-        msg = (
-            f"{emoji} <b>{result} HIT — {SYMBOL}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📌 Entry  : <code>{trade.entry_price:.4f} USDT</code>\n"
-            f"🚪 Exit   : <code>{trade.exit_price:.4f} USDT</code>\n"
-            f"💰 PnL    : <code>{pnl:+.2f}%</code>\n"
-            f"🕐 In     : <code>{trade.entered_at.strftime('%H:%M:%S UTC')}</code>\n"
-            f"🕐 Out    : <code>{trade.exited_at.strftime('%H:%M:%S UTC')}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Total trades: {len(self.trades.history)}</b>\n"
-            f"{self._summary()}"
-        )
-        await tg_send(self.session, msg)
-
-    def _summary(self) -> str:
-        if not self.trades.history:
-            return ""
-        wins    = [t for t in self.trades.history if t.status == "HIT_TP"]
-        losses  = [t for t in self.trades.history if t.status == "HIT_SL"]
-        total   = len(self.trades.history)
-        win_r   = len(wins) / total * 100 if total else 0
-        avg_pnl = sum(t.pnl_pct for t in self.trades.history) / total if total else 0
-        return (
-            f"📈 Wins: {len(wins)}  |  📉 Losses: {len(losses)}\n"
-            f"🏆 Win Rate: {win_r:.1f}%  |  Avg PnL: {avg_pnl:+.2f}%"
-        )
-
-    # ── Entry point ───────────────────────────────────────────────────────────
-    async def run(self) -> None:
-        connector = aiohttp.TCPConnector(limit=10, ssl=True)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            self.session = session
-            await self.seed()
-            await self._ws_listen()
+    return {
+        "total_trades":     n,
+        "wins":             n_win,
+        "losses":           n_loss,
+        "win_rate_pct":     win_rt * 100.0,
+        "avg_win_usd":      avg_win,
+        "avg_loss_usd":     avg_loss,
+        "ev_per_trade_usd": ev,
+        "profit_factor":    pf,
+        "total_fees_usd":   total_fees,
+        "net_profit_usd":   net_profit,
+        "roi_pct":          roi_pct,
+        "final_equity_usd": result["final_equity"],
+        "max_drawdown_pct": mdd_pct,
+        "max_cons_wins":    max_cons_win,
+        "max_cons_losses":  max_cons_loss,
+    }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────
+#  PRETTY PRINT REPORT
+# ─────────────────────────────────────────────────────────────────
+def print_report(stats: dict, cfg: dict) -> None:
+    sep = "─" * 54
+
+    print("\n")
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║        SOLUSDT 5m │ 9 EMA × 9 SMA Crossover         ║")
+    print("╚══════════════════════════════════════════════════════╝")
+
+    print(f"\n{'CONFIG':}")
+    print(sep)
+    print(f"  Symbol          : {cfg['symbol']}  ({cfg['interval']})")
+    print(f"  EMA length      : {cfg['ema_len']}")
+    print(f"  SMA length      : {cfg['sma_len']}  (smoothing on EMA)")
+    print(f"  ATR length      : {cfg['atr_len']}")
+    print(f"  SL multiplier   : {cfg['sl_atr_mult']}× ATR")
+    print(f"  TP multiplier   : {cfg['tp_sl_mult']}× SL distance")
+    print(f"  Round-trip fee  : {cfg['fee_rt_pct']}%")
+    print(f"  Risk per trade  : {cfg['risk_pct']}% of equity")
+    print(f"  Starting capital: ${cfg['initial_capital']:,.2f}")
+    print(f"  Lookback        : {cfg['lookback_days']} days")
+
+    if stats.get("total_trades", 0) == 0:
+        print("\n⚠️   No trades generated — try adjusting parameters.")
+        return
+
+    print(f"\n{'TRADE SUMMARY':}")
+    print(sep)
+    print(f"  Total trades    : {stats['total_trades']}")
+    print(f"  Wins            : {stats['wins']}")
+    print(f"  Losses          : {stats['losses']}")
+    print(f"  Win rate        : {stats['win_rate_pct']:.1f}%")
+    print(f"  Max consec wins : {stats['max_cons_wins']}")
+    print(f"  Max consec loss : {stats['max_cons_losses']}")
+
+    print(f"\n{'PERFORMANCE':}")
+    print(sep)
+    print(f"  Avg win  (net)  : ${stats['avg_win_usd']:+.2f}")
+    print(f"  Avg loss (net)  : ${stats['avg_loss_usd']:+.2f}")
+    print(f"  EV / trade      : ${stats['ev_per_trade_usd']:+.2f}")
+    print(f"  Profit factor   : {stats['profit_factor']:.2f}")
+    print(f"  Total fees paid : ${stats['total_fees_usd']:.2f}")
+
+    print(f"\n{'ACCOUNT':}")
+    print(sep)
+    print(f"  Starting equity : ${cfg['initial_capital']:,.2f}")
+    print(f"  Final equity    : ${stats['final_equity_usd']:,.2f}")
+    net = stats['net_profit_usd']
+    roi = stats['roi_pct']
+    sign = "+" if net >= 0 else ""
+    print(f"  Net profit      : {sign}${net:,.2f}  ({sign}{roi:.1f}%)")
+    print(f"  Max drawdown    : {stats['max_drawdown_pct']:.1f}%")
+
+    ev  = stats['ev_per_trade_usd']
+    ev_label = "✅ Positive EV" if ev > 0 else "❌ Negative EV"
+    print(f"\n  {ev_label}  (EV = ${ev:+.2f}/trade)")
+    print(sep)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  OPTIONAL: SAVE TRADE LOG TO CSV
+# ─────────────────────────────────────────────────────────────────
+def save_trade_log(trades: list, filename: str = "trade_log.csv") -> None:
+    if not trades:
+        return
+    df = pd.DataFrame(trades)
+    df.to_csv(filename, index=False)
+    print(f"📄  Trade log saved → {filename}")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────
+def main():
+    cfg = {
+        "symbol":          SYMBOL,
+        "interval":        INTERVAL,
+        "lookback_days":   LOOKBACK_DAYS,
+        "ema_len":         EMA_LEN,
+        "sma_len":         SMA_LEN,
+        "atr_len":         ATR_LEN,
+        "sl_atr_mult":     SL_ATR_MULT,
+        "tp_sl_mult":      TP_SL_MULT,
+        "initial_capital": INITIAL_CAPITAL,
+        "fee_rt_pct":      FEE_RT_PCT,
+        "risk_pct":        RISK_PCT,
+    }
+
+    # 1. Fetch data
+    df = fetch_klines(cfg["symbol"], cfg["interval"], cfg["lookback_days"])
+
+    # 2. Compute indicators
+    print("📊  Computing indicators …")
+    df = compute_indicators(df, cfg["ema_len"], cfg["sma_len"], cfg["atr_len"])
+
+    signal_count = df["signal"].sum()
+    print(f"🔔  Crossover signals found : {signal_count:,}")
+
+    # 3. Run backtest
+    print("🔁  Running backtest …")
+    result = run_backtest(
+        df,
+        initial_capital = cfg["initial_capital"],
+        sl_atr_mult     = cfg["sl_atr_mult"],
+        tp_sl_mult      = cfg["tp_sl_mult"],
+        fee_rt_pct      = cfg["fee_rt_pct"],
+        risk_pct        = cfg["risk_pct"],
+    )
+
+    # 4. Stats & report
+    stats = compute_stats(result, cfg["initial_capital"])
+    print_report(stats, cfg)
+
+    # 5. Save trade log
+    save_trade_log(result["trades"])
+
+    # 6. Mini equity curve (ASCII sparkline)
+    curve = result["equity_curve"]
+    if len(curve) > 1:
+        lo, hi = min(curve), max(curve)
+        rng    = hi - lo or 1
+        bars   = "▁▂▃▄▅▆▇█"
+        width  = min(60, len(curve))
+        step   = max(1, len(curve) // width)
+        spark  = ""
+        for k in range(0, len(curve), step):
+            idx   = min(int((curve[k] - lo) / rng * 7), 7)
+            spark += bars[idx]
+        print(f"  Equity curve  : {spark}")
+        print(f"  (${lo:,.0f} → ${hi:,.0f})\n")
+
+
 if __name__ == "__main__":
-    bot = RenkoBot()
-    try:
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user.")
+    main()
