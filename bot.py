@@ -32,7 +32,7 @@ SMA_LEN         = 9                  # Smoothing SMA length (applied to the EMA)
 
 ATR_LEN         = 14                 # ATR period for SL sizing
 SL_ATR_MULT     = 1.5                # SL = entry − (SL_ATR_MULT × ATR)
-TP_SL_MULT      = 5.0                # TP = entry + (TP_SL_MULT × SL_distance)
+TP_SL_MULT      = 3.0                # TP = entry + (TP_SL_MULT × SL_distance)
 
 INITIAL_CAPITAL = 1_000.0            # Starting account size in USD
 FEE_RT_PCT      = 0.08               # Round-trip fee in percent (0.08 = 0.08 %)
